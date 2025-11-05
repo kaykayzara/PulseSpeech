@@ -1,0 +1,13 @@
+# big data
+data/
+*.wav
+*.mp3
+
+# python
+_pycache_/
+*.pyc 
+.ven/
+.env/
+
+# vscode
+.vscode/
