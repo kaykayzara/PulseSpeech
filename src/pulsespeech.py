@@ -1,373 +1,387 @@
-# %%
-
-
+import math
+import sys
+import os
+import json
+import pandas as pd
 import numpy as np
 import librosa
 import parselmouth
 import whisper
 from sentence_transformers import SentenceTransformer
 from transformers import pipeline
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
+from sklearn.linear_model import SGDClassifier
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report
-import pandas as pd
-import os
-import sounddevice as sd
-import scipy.io.wavfile as wav
-import tempfile
+import joblib
+from tqdm import tqdm
+
+# =========================
+# CONFIGURATION
+# =========================
+BASE_RAVDESS_DIR = r"C:/Users/kayre/CBD Agitation/PulseSpeech/data/Audio_Speech_Actors_01-24"
+PROGRESS_PATH = "progress.json"
+MODEL_PATH = "emotion_model.joblib"
+FEATURE_COLS_PATH = "feature_cols.json"
+SCALER_PATH = "scaler.joblib"
+BATCH_SIZE = 50  # how many audio files to handle per run
+
+# heavy models
+WHISPER_MODEL = whisper.load_model("tiny")
+SENT_MODEL = pipeline("sentiment-analysis")
+SBERT_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
 
 
-# %%
-BASE_DIR = "C:/Users/kayre/Downloads/emovome"
-AUDIO_DIR = f"{BASE_DIR}/Audios"
-LABELS_PATH = f"{BASE_DIR}/labels.csv"
-TRANSCRIPTS_PATH = f"{BASE_DIR}/transcriptions.csv"
-
-labels_df = pd.read_csv(LABELS_PATH)
-transcripts_df = pd.read_csv(TRANSCRIPTS_PATH)
-print(labels_df.head())
-print(transcripts_df.head())
-
-merged_df = pd.merge(labels_df, transcripts_df, on="file_id", how="inner")
+# =========================
+# PROGRESS HELPERS
+# =========================
+def load_progress():
+    if os.path.exists(PROGRESS_PATH):
+        with open(PROGRESS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"processed_paths": {}, "total_processed": 0}
 
 
-print("Merged dataset shape:", df.shape)
-print(df.head(3))
-
-# PulseSpeech: Multiclass Speech Emotion + Agitation Notebook
-# 1. Ingest audio files
-# 2. Transcribe to text (Whisper)
-# 3. Extract acoustic/prosodic features (pitch, energy, pauses, MFCCs)
-# 4. Extract text features (sentiment + embeddings + words/sec)
-# 5. Train a MULTICLASS model: e.g. [neutral, happy, sad, angry, frustrated/agitated]
-# 6. Support optional per-speaker baselines to personalize detection
-# 7. Evaluate with classification report
+def save_progress(progress):
+    with open(PROGRESS_PATH, "w", encoding="utf-8") as f:
+        json.dump(progress, f, indent=2)
 
 
-# %% imports and paths
-
-
-BASE_DIR = "C:/Users/kayre/Downloads/emovome"
-AUDIO_DIR = f"{BASE_DIR}/Audios"
-LABELS_PATH = f"{BASE_DIR}/labels.csv"
-TRANSCRIPTS_PATH = f"{BASE_DIR}/transcriptions.csv"
-PARTICIPANTS_PATH = f"{BASE_DIR}/participants_ids.csv"
-
-# read dataset tables
-labels_df = pd.read_csv(LABELS_PATH)
-transcripts_df = pd.read_csv(TRANSCRIPTS_PATH)
-
-# build full audio path
-merged_df["audio_path"] = merged_df["file_id"].apply(
-    lambda x: os.path.join(AUDIO_DIR, f"{x}.wav"))
-
-# pick a label column
-merged_df["emotion"] = merged_df["category_E"]
-
-# keep only what we need
-merged_df = merged_df[["audio_path", "emotion",
-                       "transcription", "participant_id"]]
-print(merged_df.head())
-
-
-# %% load heavy models once
-# you can skip whisper if you trust transcriptions.csv
-
-
-whisper_model = whisper.load_model("small")
-sent_model = pipeline("sentiment-analysis")
-sbert = SentenceTransformer("all-MiniLM-L6-v2")
-
-
-# %% load ravdess
-
-RAVDESS_DIR = r"C:\Users\kayre\Downloads\ravdess"
-
-
-def load_ravdess(base_dir=RAVDESS_DIR):
-    audio_paths = []
-    labels = []
-
-    for root, dirs, files in os.walk(base_dir):
-        for f in files:
-            if f.lower().endswith(".wav"):
-                full = os.path.join(root, f)
-                # ravdess filenames encode emotion in the name: 03 = happy, 05 = angry, etd
-                parts = f.split("-")
-                emotion_id = int(parts[2])
-                audio_paths.append(full)
-                labels.append(emotion_id)
-
-    df = pd.DataFrame({"audio_path": audio_paths, "emotion_id": labels})
+# =========================
+# DATA LOADING
+# =========================
+def load_ravdess(base_dir):
+    emotion_map = {
+        1: "neutral", 2: "calm", 3: "happy", 4: "sad",
+        5: "angry", 6: "fearful", 7: "disgust", 8: "surprised"
+    }
+    audio_paths, labels = [], []
+    for root, _, files in os.walk(base_dir):
+        for file in files:
+            if file.endswith(".wav"):
+                path = os.path.join(root, file)
+                # filename looks like "03-01-01-01-01-01-01.wav"
+                emotion_id = int(file.split("-")[2])
+                audio_paths.append(path)
+                labels.append(emotion_map.get(emotion_id, "unknown"))
+    df = pd.DataFrame({
+        "audio_path": audio_paths,
+        "emotion": labels,
+        "transcription": "",  # blank for now
+        "participant_id": ["rav_" + os.path.basename(p) for p in audio_paths]
+    })
     return df
 
 
-rav_df = load_ravdess()
-print(rav_df.head())
+def load_all_datasets():
+    # for now we just load RAVDESS, same as before
+    return load_ravdess(BASE_RAVDESS_DIR)
 
 
-# %%
-# record to wav
+# =========================
+# TRANSCRIPT SAVING
+# =========================
+def save_transcript_to_actor_folder(audio_path, transcript, emotion):
+    """
+    audio_path: .../Audio_Speech_Actors_01-24/Actor_01/xxx.wav
+    we will save to: .../Audio_Speech_Actors_01-24/Actor_01/transcriptions (code)/xxx.txt
+    """
+    actor_dir = os.path.dirname(audio_path)
+    trans_dir = os.path.join(actor_dir, "transcriptions (code)")
+    os.makedirs(trans_dir, exist_ok=True)
+
+    base_name = os.path.splitext(os.path.basename(audio_path))[0] + ".txt"
+    out_path = os.path.join(trans_dir, base_name)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(f"[Emotion: {emotion}]\n\n{transcript.strip()}")
+    return out_path
 
 
-def record_to_wav(seconds=4, sr=16000):
-    print("Recording...")
-    audio = sd.rec(int(seconds * sr), samplerate=sr, channels=1)
-    sd.wait()
-    print("Done recording.")
-    audio = audio.flatten()
-
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".wav")
-    os.close(tmp_fd)
-    wav.write(tmp_path, sr, (audio * 32767).astype("int16"))
-    return tmp_path
-
-
-# %% transcription helper (we might not need it if we trust dataset text)
-
-
-def transcribe_audio(path: str):
-    result = whisper_model.transcribe(path)
-    text = result["text"].strip()
-    segments = result.get("segments", [])
-    duration = librosa.get_duration(filename=path)
-    return text, segments, duration
-
-
-# %% audio features
-
-
-def extract_audio_features(path, sr=16000):
-    try:
-        y, sr = librosa.load(path, sr=sr)
-    except Exception as e:
-        print("could not load", path, e)
-        return None
-
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13).mean(axis=1)
-    zcr = librosa.feature.zero_crossing_rate(y).mean()
-    rms = librosa.feature.rms(y=y).mean()
-    return np.concatenate([mfcc, [zcr, rms]])
-
-
-X_audio = []
-X_text = []
-y = []
-
-X_audio = np.vstack(X_audio)
-X_text = np.vstack(X_text)
-
-# combine audio and text
-X = np.hstack([X_text, X_text])
-
-
-# %% acoustic features
-
-
-def extract_acoustic_features(path: str) -> dict:
+# =========================
+# FEATURE EXTRACTION
+# =========================
+def extract_acoustic_features(path):
     y, sr = librosa.load(path, sr=16000)
-    total_duration = len(y) / sr
-
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-    mfcc_mean = mfcc.mean(axis=1)
-    mfcc_std = mfcc.std(axis=1)
-
+    duration = librosa.get_duration(y=y, sr=sr)
     rms = float(librosa.feature.rms(y=y).mean())
     zcr = float(librosa.feature.zero_crossing_rate(y).mean())
 
-    intervals = librosa.effects.split(y, top_db=30)
-    speech_dur = sum((i[1] - i[0]) for i in intervals) / sr
-    pause_ratio = 1.0 - \
-        (speech_dur / total_duration) if total_duration > 0 else 0.0
+    pitch = parselmouth.Sound(path).to_pitch().selected_array["frequency"]
+    pitch_vals = pitch[pitch > 0]
+    pitch_mean = float(pitch_vals.mean()) if len(pitch_vals) else 0.0
+    pitch_std = float(pitch_vals.std()) if len(pitch_vals) else 0.0
 
-    # pitch via parselmouth
-    snd = parselmouth.Sound(path)
-    pitch = snd.to_pitch()
-    pitch_vals = pitch.selected_array["frequency"]
-    pitch_vals = pitch_vals[pitch_vals > 0]
-    if len(pitch_vals) > 0:
-        pitch_mean = float(np.mean(pitch_vals))
-        pitch_std = float(np.std(pitch_vals))
-    else:
-        pitch_mean = 0.0
-        pitch_std = 0.0
-
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
     feats = {
-        "duration": float(total_duration),
+        "duration": duration,
         "rms": rms,
         "zcr": zcr,
-        "pause_ratio": float(pause_ratio),
         "pitch_mean": pitch_mean,
         "pitch_std": pitch_std,
     }
-
-    for i, v in enumerate(mfcc_mean):
+    for i, v in enumerate(mfcc.mean(axis=1)):
         feats[f"mfcc_mean_{i}"] = float(v)
-    for i, v in enumerate(mfcc_std):
+    for i, v in enumerate(mfcc.std(axis=1)):
         feats[f"mfcc_std_{i}"] = float(v)
-
-    return feats
-
-
-# %% text features
+    return feats, duration
 
 
-def extract_text_features(text: str, duration: float) -> dict:
-    sent = sent_model(text[:512])[0]
-    sent_is_pos = 1 if sent["label"].lower().startswith("pos") else 0
-
+def extract_text_features(text, duration):
+    # sentiment
+    sent = SENT_MODEL(text[:512])[0]
+    sent_is_pos = 1 if "pos" in sent["label"].lower() else 0
     words = text.split()
     wps = len(words) / max(duration, 1e-6)
-
-    emb = sbert.encode([text])[0]
-
-    feats = {
+    emb = SBERT_MODEL.encode([text])[0]
+    return {
         "sent_pos_label": sent_is_pos,
         "sent_score": float(sent["score"]),
         "words_per_sec": float(wps),
         "embed_mean": float(np.mean(emb)),
         "embed_std": float(np.std(emb)),
     }
+
+
+def extract_features_for_row(row):
+    audio_path = row["audio_path"]
+    transcript = row.get("transcription", "")
+
+    # transcribe if empty
+    if not transcript:
+        result = WHISPER_MODEL.transcribe(audio_path)
+        transcript = result["text"]
+
+    # save transcript to folder
+    save_transcript_to_actor_folder(audio_path, transcript, row["emotion"])
+
+    # extract audio + text features
+    audio_feats, duration = extract_acoustic_features(audio_path)
+    text_feats = extract_text_features(transcript, duration)
+
+    feats = {**audio_feats, **text_feats}
+    feats["label"] = row["emotion"]
+    feats["transcript"] = transcript
+    feats["audio_path"] = audio_path
     return feats
 
 
-# %% per-speaker baselines
+# =========================
+# MODEL HELPERS
+# =========================
+def load_model_and_metadata():
+    if os.path.exists(MODEL_PATH) and os.path.exists(FEATURE_COLS_PATH) and os.path.exists(SCALER_PATH):
+        clf = joblib.load(MODEL_PATH)
+        scaler = joblib.load(SCALER_PATH)
+        with open(FEATURE_COLS_PATH, "r", encoding="utf-8") as f:
+            feature_cols = json.load(f)
+        return clf, scaler, feature_cols
+    return None, None, None
 
 
-personal_baselines = {}
+def save_model_and_metadata(clf, scaler, feature_cols):
+    joblib.dump(clf, MODEL_PATH)
+    joblib.dump(scaler, SCALER_PATH)
+    with open(FEATURE_COLS_PATH, "w", encoding="utf-8") as f:
+        json.dump(feature_cols, f, indent=2)
 
 
-def build_baseline_for_speaker(speaker_id: str, audio_files: list):
-    rows = []
-    for f in audio_files:
-        # here we re-transcribe; you could also look up transcription in merged_df instead
-        text, segs, dur = transcribe_audio(f)
-        a_feats = extract_acoustic_features(f)
-        t_feats = extract_text_features(text, dur)
-        feats = {**a_feats, **t_feats}
-        rows.append(feats)
-    df = pd.DataFrame(rows)
-    mu = df.mean(numeric_only=True)
-    sigma = df.std(numeric_only=True).replace(0, 1e-6)
-    personal_baselines[speaker_id] = {
-        "mu": mu.to_dict(), "sigma": sigma.to_dict()}
-    return personal_baselines[speaker_id]
+# =========================
+# TRAINING LOOP (INCREMENTAL)
+# =========================
+def incremental_train(df):
+    progress = load_progress()
+    processed_paths = set(progress["processed_paths"].keys())
 
+    # filter to unprocessed rows
+    unprocessed_df = df[~df["audio_path"].isin(processed_paths)]
+    total_files = len(df)
+    remaining = len(unprocessed_df)
 
-def deviation_from_baseline(speaker_id: str, feats: dict, keys=None) -> float:
-    if speaker_id not in personal_baselines:
-        return 0.0
-    if keys is None:
-        keys = ["pitch_mean", "rms", "words_per_sec", "pause_ratio"]
-    base = personal_baselines[speaker_id]
-    mu = base["mu"]
-    sigma = base["sigma"]
-    score = 0.0
-    cnt = 0
-    for k in keys:
-        if k in feats and k in mu:
-            z = (feats[k] - mu[k]) / sigma[k]
-            if k == "pause_ratio":
-                z = abs(z)
-            score += max(0, z)
-            cnt += 1
-    return score / cnt if cnt > 0 else 0.0
+    if remaining == 0:
+        print("✅ All files have already been processed and trained on.")
+        return
 
+    # pick a batch
+    batch_df = unprocessed_df.head(BATCH_SIZE)
+    print(
+        f"Processing {len(batch_df)} new files out of {remaining} remaining...")
 
-# %% extract all features for ONE row from merged_df
+    # extract features for this batch
+    feat_rows = []
+    for _, row in tqdm(batch_df.iterrows(), total=len(batch_df), desc="Feature extraction"):
+        try:
+            feats = extract_features_for_row(row)
+            feat_rows.append(feats)
+        except Exception as e:
+            print(f"⚠️ Skipping {row['audio_path']} due to error: {e}")
 
+    if not feat_rows:
+        print("No features extracted in this batch.")
+        return
 
-def extract_all_features(path: str, transcript: str = None, speaker_id: str = None) -> dict:
-    # use provided transcript if we have it (EMOVOME gives it!)
-    if transcript is None:
-        text, segs, dur = transcribe_audio(path)
+    feat_df = pd.DataFrame(feat_rows)
+
+    # separate features/labels
+    y_batch = feat_df["label"]
+    X_batch = feat_df.drop(columns=["label", "transcript", "audio_path"])
+
+    # load or init model
+    clf, scaler, feature_cols = load_model_and_metadata()
+    classes = sorted(df["emotion"].unique())
+
+    if clf is None:
+        # first run: we define feature columns from this batch
+        feature_cols = list(X_batch.columns)
+        scaler = StandardScaler()
+        scaler.fit(X_batch[feature_cols])
+        X_scaled = scaler.transform(X_batch[feature_cols])
+
+        clf = SGDClassifier(loss="log_loss", random_state=42)
+        # initial partial_fit must have classes
+        clf.partial_fit(X_scaled, y_batch, classes=classes)
     else:
-        text = transcript
-        dur = librosa.get_duration(filename=path)
+        # existing model: align columns
+        # if new columns appear (shouldn't normally), fill with 0
+        for col in feature_cols:
+            if col not in X_batch.columns:
+                X_batch[col] = 0.0
+        X_batch = X_batch[feature_cols]  # same order
 
-    a_feats = extract_acoustic_features(path)
-    t_feats = extract_text_features(text, dur)
-    feats = {**a_feats, **t_feats}
+        # scale using existing scaler
+        X_scaled = scaler.transform(X_batch)
 
-    dev = deviation_from_baseline(speaker_id, feats) if speaker_id else 0.0
-    feats["personal_deviation"] = dev
-    feats["transcript"] = text
-    return feats
+        # incremental update
+        clf.partial_fit(X_scaled, y_batch)
 
+    # save updated model + metadata
+    save_model_and_metadata(clf, scaler, feature_cols)
 
-# %%
-# live predict
+    # update progress
+    for p in feat_df["audio_path"]:
+        if p in progress["processed_paths"]:
+            progress["processed_paths"][p] += 1
+        else:
+            progress["processed_paths"][p] = 1
+        progress["total_processed"] += 1
 
+    save_progress(progress)
 
-def live_predict(clf, feature_cols, seconds=4, speaker_id=None):
-    # 1. record mic
-    wav_path = record_to_wav(seconds=seconds, sr=16000)
-
-    # 2. transcribe with whisper
-    resuls = predict_emotion(
-        clf,
-        feature_cols,
-        path=wav_path,
-        transcript=None,
-        speaker_id=speaker_id
-    )
-    print("Live prediction:", result["predicted_emotion"])
-    print("Probs:", result["proba"])
-    print("Transcript:", result["transcript"])
-    return result
+    # print status
+    trained_so_far = len(progress["processed_paths"])
+    print(f"✅ Batch complete. Trained on {len(batch_df)} new files.")
+    print(f"📊 Total unique files trained on: {trained_so_far}/{total_files}")
 
 
-# %% train multiclass model on EMOVOME
+# =========================
+# OPTIONAL: EVAL ON ALL PROCESSED
+# =========================
+def evaluate_on_all(df):
+    # Only possible if we have model + scaler + feature cols
+    clf, scaler, feature_cols = load_model_and_metadata()
+    if clf is None:
+        print("No model to evaluate.")
+        return
+
+    feat_rows = []
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Re-extract for eval"):
+        try:
+            feats = extract_features_for_row(row)
+            feat_rows.append(feats)
+        except Exception:
+            continue
+
+    feat_df = pd.DataFrame(feat_rows)
+    y_true = feat_df["label"]
+    X = feat_df.drop(columns=["label", "transcript", "audio_path"])
+
+    # align
+    for col in feature_cols:
+        if col not in X.columns:
+            X[col] = 0.0
+    X = X[feature_cols]
+    X_scaled = scaler.transform(X)
+
+    y_pred = clf.predict(X_scaled)
+    print(classification_report(y_true, y_pred))
 
 
-def train_multiclass_model_from_merged(df: pd.DataFrame):
-    rows = []
-    for _, row in df.iterrows():
-        audio_path = row["audio_path"]
-        emotion = row["emotion"]
-        transcript = row["transcription"]
-        speaker_id = row["participant_id"]
-        feats = extract_all_features(
-            audio_path, transcript=transcript, speaker_id=speaker_id)
-        feats["label"] = emotion
-        rows.append(feats)
-
-    feat_df = pd.DataFrame(rows)
-    y = feat_df["label"]
-    # transcript is text, we already encoded parts of it
-    X = feat_df.drop(columns=["label", "transcript"])
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.25, random_state=42, stratify=y
-    )
-
-    clf = RandomForestClassifier(n_estimators=250, random_state=42)
-    clf.fit(X_train, y_train)
-
-    y_pred = clf.predict(X_test)
-    print(classification_report(y_test, y_pred))
-
-    return clf, X.columns.tolist()
+# =========================
 
 
-# train it
-clf, feature_cols = train_multiclass_model_from_merged(merged_df)
+def prepare_test_batch(df, batch_size=5):
+    progress = load_progress()
+    trained_paths = set(progress["processed_paths"].keys())
+    untrained = df[~df["audio_path"].isin(trained_paths)]
+    if untrained.empty:
+        print("✅ No remaining files left for testing.")
+        return None
 
-# try live mic
-live_predict(clf, feature_cols, seconds=4)
-# %% prediction helper
+    os.makedirs("data", exist_ok=True)
+    total_batches = math.ceil(len(untrained) / batch_size)
+    batch_idx = len([f for f in os.listdir("data") if f.startswith("test")])
+    start_idx = batch_idx * batch_size
+    batch_df = untrained.iloc[start_idx:start_idx + batch_size]
+
+    out_path = f"data/test{batch_idx+1}.txt"
+    with open(out_path, "w", encoding="utf-8") as f:
+        for _, row in batch_df.iterrows():
+            f.write(
+                f"File: {row['audio_path']}\nEmotion: {row['emotion']}\nTranscription: (pending)\n\n")
+    print(f"📝 Saved test batch info to {out_path}")
+    return batch_df
 
 
-def predict_emotion(clf, feature_columns, path: str, transcript: str = None, speaker_id: str = None):
-    feats = extract_all_features(
-        path, transcript=transcript, speaker_id=speaker_id)
-    text = feats.pop("transcript")
-    x_vec = [feats.get(col, 0.0) for col in feature_columns]
-    proba = clf.predict_proba([x_vec])[0]
-    pred_label = clf.classes_[np.argmax(proba)]
-    return {
-        "predicted_emotion": pred_label,
-        "proba": {lab: float(p) for lab, p in zip(clf.classes_, proba)},
-        "transcript": text,
-        "raw_features": feats,
-    }
+def test_batch(df):
+    clf, scaler, feature_cols = load_model_and_metadata()
+    if clf is None:
+        print("⚠️ No trained model found.")
+        return
+
+    progress = load_progress
+    trained_paths = set(progress["processed_paths"].keys())
+    untrained = df[~df["audio_path"].isin(trained_paths)]
+    test_df = untrained.head(5)
+    if test_df.empty:
+        print("No untrained samples left.")
+        return
+
+    feat_rows = []
+    for _, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Testing batch"):
+        feats = extract_features_for_row(row)
+        feat_rows.append(feats)
+    feat_df = pd.DataFrame(feat_rows)
+
+    y_true = feat_df["label"]
+    X = feat_df.drop(columns=["label", "transcript", "audio_path"])
+    for col in feature_cols:
+        if col not in X.columns:
+            X[col] = 0.0
+    X = X[feature_cols]
+    X_scaled = scaler.transform(X)
+    y_pred = clf.predict(X_scaled)
+
+    out_path = "data/test_results.txt"
+    with open(out_path, "a", encoding="utf-8") as f:
+        for path, true, pred in zip(feat_df["audio_path"], y_true, y_pred):
+            f.write(f"{os.path.basename(path)}: true={true}, predicted={pred}\n")
+    print(f"✅ Test results saved to {out_path}")
+    print(classification_report(y_true, y_pred))
+
+
+# =========================
+# MAIN
+# =========================
+if __name__ == "__main__":
+    df = load_all_datasets()
+
+    if len(sys.argv) < 2:
+        print("Usage: python pulsespeech.py [train|test|prepare-test]")
+    else:
+        cmd = sys.argv[1]
+        if cmd == "train":
+            incremental_train(df)
+        elif cmd == "prepare-test":
+            prepare_test_batch(df)
+        elif cmd == "test":
+            test_batch(df)
+        else:
+            print(f"Unknown command: {cmd}")
