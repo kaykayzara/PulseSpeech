@@ -28,7 +28,14 @@ FEATURE_COLS_PATH = "rf_feature_cols.json"
 
 def load_ravdess(base_dir):
     emotion_map = {
-        1: "neutral", 2: "calm", 3: "happy", 4: "sad", 5: "angry", 6: "fearful", 7: "disgust", 8: "surprised"
+        1: "neutral",
+        2: "calm",
+        3: "happy",
+        4: "sad",
+        5: "angry",
+        6: "fearful",
+        7: "disgust",
+        8: "surprised",
     }
 
     audio_paths = []
@@ -44,6 +51,7 @@ def load_ravdess(base_dir):
 
     df = pd.DataFrame({"audio_path": audio_paths, "emotion": labels})
     return df
+
 
 # =========================
 # FEATURE EXTRACTION
@@ -76,7 +84,7 @@ def extract_acoustic_features(audio_path):
         "rms": rms,
         "zcr": zcr,
         "pitch_mean": pitch_mean,
-        "pitch_std": pitch_std
+        "pitch_std": pitch_std,
     }
 
     for i, v in enumerate(mfcc_means):
@@ -85,6 +93,7 @@ def extract_acoustic_features(audio_path):
         feats[f"mfcc_std_{i}"] = float(v)
 
     return feats
+
 
 # =========================
 # BUILD FEATURE DATASET
@@ -101,6 +110,7 @@ def build_feature_dataframe(df):
         rows.append(feats)
 
     return pd.DataFrame(rows)
+
 
 # =========================
 # TRAIN MODEL
@@ -134,7 +144,7 @@ def train_model():
     clf = RandomForestClassifier(
         n_estimators=300,
         random_state=42,
-        n_jobs=-1
+        n_jobs=-1,
     )
     clf.fit(X_train_scaled, y_train)
 
@@ -145,13 +155,14 @@ def train_model():
     print("📊 Accuracy:", acc)
     print(classification_report(y_test, y_pred))
 
-    # Save model
+    # Save model + scaler + column order
     joblib.dump(clf, MODEL_PATH)
     joblib.dump(scaler, SCALER_PATH)
     with open(FEATURE_COLS_PATH, "w") as f:
         json.dump(list(X.columns), f)
 
     print("✅ Model saved!")
+
 
 # =========================
 # MAIN
@@ -160,20 +171,3 @@ def train_model():
 
 if __name__ == "__main__":
     train_model()
-
-
-# =========================
-# =========================
-# =========================
-# =========================
-# =========================
-# =========================
-# =========================
-# =========================
-# =========================
-# =========================
-# =========================
-# =========================
-# =========================
-# =========================
-# =========================
