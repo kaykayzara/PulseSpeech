@@ -15,7 +15,7 @@ import joblib
 # CONFIG
 # =========================
 
-BASE_RAVDESS_DIR = r"C:/Users/kayre/CBD Agitation/PulseSpeech/data/Audi_Speech_Actors_01-24"
+BASE_RAVDESS_DIR = r"C:/Users/kayre/CBD Agitation/PulseSpeech/data/Audio_Speech_Actors_01-24"
 
 MODEL_PATH = "rf_emotion_model.joblib"
 SCALER_PATH = "rf_scaler.joblib"

@@ -270,6 +270,7 @@ class LiveMicGUI:
     def listen_transcribe_and_predict(self):
         global buffer
         with sd.InputStream(
+            device=1,
             samplerate=SAMPLE_RATE,
             channels=CHANNELS,
             callback=audio_callback,
@@ -302,6 +303,9 @@ class LiveMicGUI:
                     if len(mono) > max_window:
                         mono = mono[-max_window:]
 
+                    if len(mono) < 500:
+                        continue
+
                     # Run Whisper + Emotion in a background thread
                     threading.Thread(
                         target=self.process_audio_in_background,
@@ -314,6 +318,11 @@ class LiveMicGUI:
     def process_audio_in_background(self, mono, last_transcription):
         # ----- TRANSCRIPTION -----
         text = ""
+
+        if len(mono) == 0:
+            print("Skipping Whisper: empty audio buffer")
+            return
+
         try:
             result = whisper_model.transcribe(
                 mono,
