@@ -318,9 +318,12 @@ class LiveMicGUI:
     def process_audio_in_background(self, mono, last_transcription):
         # ----- TRANSCRIPTION -----
         text = ""
+        last_transcription = text
 
-        if len(mono) == 0:
-            print("Skipping Whisper: empty audio buffer")
+        # --- REQUIRED MINIMUM AUDIO LENGTH
+        MIN_SAMPLES = int(0.75 * SAMPLE_RATE)
+        if len(mono) < MIN_SAMPLES:
+            print(f"Skipping Whisper: audio too short ({len(mono)} samples)")
             return
 
         try:
